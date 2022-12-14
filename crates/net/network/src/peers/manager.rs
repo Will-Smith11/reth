@@ -1,6 +1,9 @@
 use crate::peers::{reputation::BANNED_REPUTATION, ReputationChangeKind, ReputationChangeWeights};
 use futures::StreamExt;
-use reth_eth_wire::DisconnectReason;
+use reth_eth_wire::{
+    error::{EthStreamError, HandshakeError, P2PHandshakeError, P2PStreamError},
+    DisconnectReason,
+};
 use reth_primitives::PeerId;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
@@ -18,6 +21,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::trace;
 
 /// A communication channel to the [`PeersManager`] to apply manual changes to the peer set.
+#[derive(Clone)]
 pub struct PeersHandle {
     /// Sender half of command channel back to the [`PeersManager`]
     manager_tx: mpsc::UnboundedSender<PeerCommand>,
@@ -126,6 +130,11 @@ impl PeersManager {
         self.connection_info.decr_out()
     }
 
+    /// Invoked when a pending session was closed.
+    pub(crate) fn on_closed_outgoing_pending_session(&mut self) {
+        self.connection_info.decr_out()
+    }
+
     /// Called when a new _incoming_ active session was established to the given peer.
     ///
     /// This will update the state of the peer if not yet tracked.
@@ -184,16 +193,29 @@ impl PeersManager {
             self.connection_info.decr_state(peer.state);
             peer.state = PeerConnectionState::Idle;
         }
+
+        self.fill_outbound_slots();
     }
 
     /// Called when a session to a peer was forcefully disconnected.
-    pub(crate) fn on_connection_dropped(&mut self, peer_id: &PeerId) {
-        let reputation_change = self.reputation_weights.change(ReputationChangeKind::Dropped);
-        if let Some(mut peer) = self.peers.get_mut(peer_id) {
+    ///
+    /// Depending on whether the error is fatal, the peer will be removed from the peer set
+    /// otherwise its reputation is slashed.
+    pub(crate) fn on_connection_dropped(&mut self, peer_id: &PeerId, err: &EthStreamError) {
+        if is_fatal_protocol_error(err) {
+            // remove the peer to which we can't establish a connection due to protocol related
+            // issues.
+            if let Some(peer) = self.peers.remove(peer_id) {
+                self.connection_info.decr_state(peer.state);
+            }
+        } else if let Some(mut peer) = self.peers.get_mut(peer_id) {
             self.connection_info.decr_state(peer.state);
             peer.state = PeerConnectionState::Idle;
+            let reputation_change = self.reputation_weights.change(ReputationChangeKind::Dropped);
             peer.reputation = peer.reputation.saturating_sub(reputation_change.as_i32());
         }
+
+        self.fill_outbound_slots();
     }
 
     /// Called for a newly discovered peer.
@@ -209,12 +231,15 @@ impl PeersManager {
             Entry::Occupied(mut entry) => {
                 let node = entry.get_mut();
                 node.addr = addr;
+                return
             }
             Entry::Vacant(entry) => {
                 trace!(target : "net::peers", ?peer_id, ?addr, "discovered new node");
                 entry.insert(Peer::new(addr));
             }
         }
+
+        self.fill_outbound_slots();
     }
 
     /// Removes the tracked node from the set.
@@ -313,9 +338,9 @@ impl PeersManager {
 /// Tracks stats about connected nodes
 #[derive(Debug)]
 pub struct ConnectionInfo {
-    /// Currently occupied slots for outbound connections.
+    /// Counter for currently occupied slots for active outbound connections.
     num_outbound: usize,
-    /// Currently occupied slots for inbound connections.
+    /// Counter for currently occupied slots for active inbound connections.
     num_inbound: usize,
     /// Maximum allowed outbound connections.
     max_outbound: usize,
@@ -358,6 +383,12 @@ impl ConnectionInfo {
 
     fn decr_in(&mut self) {
         self.num_inbound -= 1;
+    }
+}
+
+impl Default for ConnectionInfo {
+    fn default() -> Self {
+        ConnectionInfo { num_outbound: 0, num_inbound: 0, max_outbound: 100, max_inbound: 30 }
     }
 }
 
@@ -480,12 +511,7 @@ impl Default for PeersConfig {
     fn default() -> Self {
         Self {
             refill_slots_interval: Duration::from_millis(1_000),
-            connection_info: ConnectionInfo {
-                num_outbound: 0,
-                num_inbound: 0,
-                max_outbound: 70,
-                max_inbound: 30,
-            },
+            connection_info: Default::default(),
             reputation_weights: Default::default(),
             ban_list: Default::default(),
         }
@@ -501,7 +527,7 @@ impl PeersConfig {
 
     /// Maximum occupied slots for outbound connections.
     pub fn with_max_pending_outbound(mut self, num_outbound: usize) -> Self {
-        self.connection_info.num_inbound = num_outbound;
+        self.connection_info.num_outbound = num_outbound;
         self
     }
 
@@ -574,6 +600,26 @@ impl Display for InboundConnectionError {
     }
 }
 
+/// Returns true if the error indicates that we'll never be able to establish a connection to that
+/// peer. For example, not matching capabilities or a mismatch in protocols.
+fn is_fatal_protocol_error(err: &EthStreamError) -> bool {
+    match err {
+        EthStreamError::P2PStreamError(err) => {
+            matches!(
+                err,
+                P2PStreamError::HandshakeError(P2PHandshakeError::NoSharedCapabilities) |
+                    P2PStreamError::UnknownReservedMessageId(_) |
+                    P2PStreamError::EmptyProtocolMessage |
+                    P2PStreamError::ParseVersionError(_) |
+                    P2PStreamError::Disconnected(DisconnectReason::UselessPeer) |
+                    P2PStreamError::MismatchedProtocolVersion { .. }
+            )
+        }
+        EthStreamError::HandshakeError(err) => !matches!(err, HandshakeError::NoResponse),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{
@@ -583,7 +629,13 @@ mod test {
 
     use reth_primitives::{PeerId, H512};
 
-    use crate::{peers::PeerAction, BanList, PeersConfig};
+    use crate::{
+        peers::{
+            manager::{ConnectionInfo, PeerConnectionState},
+            PeerAction,
+        },
+        BanList, PeersConfig,
+    };
 
     use super::PeersManager;
 
@@ -632,5 +684,43 @@ mod test {
         let Some(PeerAction::DisconnectBannedIncoming { peer_id }) = peer_manager.queued_actions.pop_front() else { panic!() };
 
         assert_eq!(peer_id, given_peer_id)
+    }
+
+    #[test]
+    fn test_connection_limits() {
+        let mut info = ConnectionInfo::default();
+        info.inc_in();
+        assert_eq!(info.num_inbound, 1);
+        assert_eq!(info.num_outbound, 0);
+        assert!(info.has_in_capacity());
+
+        info.decr_in();
+        assert_eq!(info.num_inbound, 0);
+        assert_eq!(info.num_outbound, 0);
+
+        info.inc_out();
+        assert_eq!(info.num_inbound, 0);
+        assert_eq!(info.num_outbound, 1);
+        assert!(info.has_out_capacity());
+
+        info.decr_out();
+        assert_eq!(info.num_inbound, 0);
+        assert_eq!(info.num_outbound, 0);
+    }
+
+    #[test]
+    fn test_connection_peer_state() {
+        let mut info = ConnectionInfo::default();
+        info.inc_in();
+
+        info.decr_state(PeerConnectionState::In);
+        assert_eq!(info.num_inbound, 0);
+        assert_eq!(info.num_outbound, 0);
+
+        info.inc_out();
+
+        info.decr_state(PeerConnectionState::Out);
+        assert_eq!(info.num_inbound, 0);
+        assert_eq!(info.num_outbound, 0);
     }
 }
