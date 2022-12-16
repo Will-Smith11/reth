@@ -1,5 +1,4 @@
 use crate::{
-    fetch::StatusUpdate,
     listener::{ConnectionListener, ListenerEvent},
     message::{PeerMessage, PeerRequestSender},
     peers::InboundConnectionError,
@@ -10,6 +9,7 @@ use futures::Stream;
 use reth_eth_wire::{
     capability::{Capabilities, CapabilityMessage},
     error::EthStreamError,
+    Status,
 };
 use reth_primitives::PeerId;
 use reth_provider::BlockProvider;
@@ -133,6 +133,7 @@ where
                     remote_addr,
                     capabilities,
                     messages,
+                    status,
                     direction,
                 })
             }
@@ -221,7 +222,6 @@ where
                 let msg = PeerMessage::NewBlockHashes(hashes);
                 self.sessions.send_message(&peer_id, msg);
             }
-            StateAction::StatusUpdate(status) => return Some(SwarmEvent::StatusUpdate(status)),
         }
         None
     }
@@ -279,8 +279,6 @@ where
 /// All events created or delegated by the [`Swarm`] that represents changes to the state of the
 /// network.
 pub(crate) enum SwarmEvent {
-    /// Received a node status update.
-    StatusUpdate(StatusUpdate),
     /// Events related to the actual network protocol.
     ValidMessage {
         /// The peer that sent the message
@@ -329,6 +327,7 @@ pub(crate) enum SwarmEvent {
         remote_addr: SocketAddr,
         capabilities: Arc<Capabilities>,
         messages: PeerRequestSender,
+        status: Status,
         direction: Direction,
     },
     SessionClosed {

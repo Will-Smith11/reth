@@ -3,16 +3,14 @@ use reth_interfaces::{
     consensus::Consensus,
     p2p::{
         downloader::{DownloadStream, Downloader},
-        error::PeerRequestResult,
+        error::{DownloadError, DownloadResult, PeerRequestResult},
         headers::{
             client::{BlockHeaders, HeadersClient, HeadersRequest},
             downloader::{validate_header_download, HeaderDownloader},
-            error::DownloadError,
         },
     },
 };
 use reth_primitives::{HeadersDirection, SealedHeader, H256};
-use reth_rpc_types::engine::ForkchoiceState;
 use std::{
     borrow::Borrow,
     collections::VecDeque,
@@ -58,12 +56,8 @@ where
     C: Consensus + 'static,
     H: HeadersClient + 'static,
 {
-    fn stream(
-        &self,
-        head: SealedHeader,
-        forkchoice: ForkchoiceState,
-    ) -> DownloadStream<SealedHeader> {
-        Box::pin(self.new_download(head, forkchoice))
+    fn stream(&self, head: SealedHeader, tip: H256) -> DownloadStream<'_, SealedHeader> {
+        Box::pin(self.new_download(head, tip))
     }
 }
 
@@ -79,14 +73,10 @@ impl<C: Consensus, H: HeadersClient> Clone for LinearDownloader<C, H> {
 }
 
 impl<C: Consensus, H: HeadersClient> LinearDownloader<C, H> {
-    fn new_download(
-        &self,
-        head: SealedHeader,
-        forkchoice: ForkchoiceState,
-    ) -> HeadersDownload<C, H> {
+    fn new_download(&self, head: SealedHeader, tip: H256) -> HeadersDownload<C, H> {
         HeadersDownload {
             head,
-            forkchoice,
+            tip,
             buffered: VecDeque::default(),
             request: Default::default(),
             consensus: Arc::clone(&self.consensus),
@@ -133,7 +123,8 @@ impl Future for HeadersRequestFuture {
 pub struct HeadersDownload<C, H> {
     /// The local head of the chain.
     head: SealedHeader,
-    forkchoice: ForkchoiceState,
+    /// Tip to start syncing from
+    tip: H256,
     /// Buffered results
     buffered: VecDeque<SealedHeader>,
     /// Contains the request that's currently in progress.
@@ -175,7 +166,7 @@ where
 
     /// Returns the start hash for a new request.
     fn request_start(&self) -> H256 {
-        self.earliest_header().map_or(self.forkchoice.head_block_hash, |h| h.parent_hash)
+        self.earliest_header().map_or(self.tip, |h| h.parent_hash)
     }
 
     /// Get the headers request to dispatch
@@ -208,6 +199,10 @@ where
                 // queue in the first request
                 let client = Arc::clone(&self.client);
                 let req = self.headers_request();
+                tracing::trace!(
+                    target: "downloaders::headers",
+                    "requesting headers {req:?}"
+                );
                 HeadersRequestFuture {
                     request: req.clone(),
                     fut: Box::pin(async move { client.get_headers(req).await }),
@@ -243,7 +238,7 @@ where
     ///
     /// Returns Ok(false) if the
     #[allow(clippy::result_large_err)]
-    fn validate(&self, header: &SealedHeader, parent: &SealedHeader) -> Result<(), DownloadError> {
+    fn validate(&self, header: &SealedHeader, parent: &SealedHeader) -> DownloadResult<()> {
         validate_header_download(&self.consensus, header, parent)?;
         Ok(())
     }
@@ -252,7 +247,7 @@ where
     fn process_header_response(
         &mut self,
         response: PeerRequestResult<BlockHeaders>,
-    ) -> Result<(), DownloadError> {
+    ) -> DownloadResult<()> {
         match response {
             Ok(res) => {
                 let mut headers = res.1 .0;
@@ -276,12 +271,12 @@ where
                         // Proceed to insert. If there is a validation error re-queue
                         // the future.
                         self.validate(header, &parent)?;
-                    } else if parent.hash() != self.forkchoice.head_block_hash {
+                    } else if parent.hash() != self.tip {
                         // The buffer is empty and the first header does not match the
                         // tip, requeue the future
                         return Err(DownloadError::InvalidTip {
                             received: parent.hash(),
-                            expected: self.forkchoice.head_block_hash,
+                            expected: self.tip,
                         })
                     }
 
@@ -290,6 +285,8 @@ where
                 }
                 Ok(())
             }
+            // most likely a noop, because this error
+            // would've been handled by the fetcher internally
             Err(err) => Err(err.into()),
         }
     }
@@ -300,7 +297,7 @@ where
     C: Consensus + 'static,
     H: HeadersClient + 'static,
 {
-    type Item = Result<SealedHeader, DownloadError>;
+    type Item = DownloadResult<SealedHeader>;
 
     /// Linear header downloader implemented as a [Stream]. The downloader sends header
     /// requests until the head is reached and buffers the responses. If the request future
@@ -330,6 +327,7 @@ where
             let mut fut = this.get_or_init_fut();
             match fut.poll_unpin(cx) {
                 Poll::Ready(result) => {
+                    let peer_id = result.as_ref().map(|res| res.peer_id()).ok();
                     // Process the response, buffering the headers
                     // in case of successful validation
                     match this.process_header_response(result) {
@@ -342,6 +340,14 @@ where
                             }
                         }
                         Err(err) => {
+                            // Penalize the peer for bad response
+                            if let Some(peer_id) = peer_id {
+                                tracing::trace!(
+                                    target: "downloaders::headers",
+                                    "penalizing peer {peer_id} for {err:?}"
+                                );
+                                this.client.report_bad_message(peer_id);
+                            }
                             // Response is invalid, attempt to retry
                             if this.try_fuse_request_fut(&mut fut).is_err() {
                                 tracing::trace!(
@@ -446,7 +452,7 @@ mod tests {
             LinearDownloadBuilder::default().build(CONSENSUS.clone(), Arc::clone(&client));
 
         let result = downloader
-            .stream(SealedHeader::default(), ForkchoiceState::default())
+            .stream(SealedHeader::default(), H256::default())
             .try_collect::<Vec<_>>()
             .await;
         assert!(result.is_err());
@@ -473,9 +479,7 @@ mod tests {
             ])
             .await;
 
-        let fork = ForkchoiceState { head_block_hash: p0.hash_slow(), ..Default::default() };
-
-        let result = downloader.stream(p0, fork).try_collect::<Vec<_>>().await;
+        let result = downloader.stream(p0.clone(), p0.hash_slow()).try_collect::<Vec<_>>().await;
         let headers = result.unwrap();
         assert!(headers.is_empty());
     }
@@ -501,9 +505,7 @@ mod tests {
             ])
             .await;
 
-        let fork = ForkchoiceState { head_block_hash: p0.hash_slow(), ..Default::default() };
-
-        let result = downloader.stream(p3, fork).try_collect::<Vec<_>>().await;
+        let result = downloader.stream(p3, p0.hash_slow()).try_collect::<Vec<_>>().await;
         let headers = result.unwrap();
         assert_eq!(headers.len(), 3);
         assert_eq!(headers[0], p0);
@@ -518,7 +520,7 @@ mod tests {
             LinearDownloadBuilder::default().build(CONSENSUS.clone(), Arc::clone(&client));
 
         let result = downloader
-            .stream(SealedHeader::default(), ForkchoiceState::default())
+            .stream(SealedHeader::default(), H256::default())
             .try_collect::<Vec<_>>()
             .await;
         assert!(result.is_err());
@@ -545,9 +547,7 @@ mod tests {
             ])
             .await;
 
-        let fork = ForkchoiceState { head_block_hash: p0.hash_slow(), ..Default::default() };
-
-        let result = downloader.stream(p3, fork).try_collect::<Vec<_>>().await;
+        let result = downloader.stream(p3, p0.hash_slow()).try_collect::<Vec<_>>().await;
         let headers = result.unwrap();
         assert_eq!(headers.len(), 3);
         assert_eq!(headers[0], p0);

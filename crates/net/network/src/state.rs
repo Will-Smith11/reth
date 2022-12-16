@@ -3,7 +3,7 @@
 use crate::{
     cache::LruCache,
     discovery::{Discovery, DiscoveryEvent},
-    fetch::{BlockResponseOutcome, FetchAction, StateFetcher, StatusUpdate},
+    fetch::{BlockResponseOutcome, FetchAction, StateFetcher},
     message::{
         BlockRequest, NewBlockMessage, PeerRequest, PeerRequestSender, PeerResponse,
         PeerResponseResult,
@@ -14,7 +14,7 @@ use crate::{
 use reth_eth_wire::{
     capability::Capabilities, BlockHashNumber, DisconnectReason, NewBlockHashes, Status,
 };
-use reth_primitives::{PeerId, H256};
+use reth_primitives::{ForkId, PeerId, H256};
 use reth_provider::BlockProvider;
 use std::{
     collections::{HashMap, VecDeque},
@@ -70,6 +70,7 @@ where
         peers_manager: PeersManager,
         genesis_hash: H256,
     ) -> Self {
+        let state_fetcher = StateFetcher::new(peers_manager.handle());
         Self {
             active_peers: Default::default(),
             peers_manager,
@@ -77,7 +78,7 @@ where
             client,
             discovery,
             genesis_hash,
-            state_fetcher: Default::default(),
+            state_fetcher,
         }
     }
 
@@ -215,6 +216,12 @@ where
         self.state_fetcher.update_peer_block(peer_id, hash, number);
     }
 
+    /// Invoked on a [`ForkId`] update
+    #[allow(unused)]
+    pub(crate) fn update_fork_id(&mut self, _fork_id: ForkId) {
+        todo!()
+    }
+
     /// Invoked after a `NewBlock` message was received by the peer.
     ///
     /// This will keep track of blocks we know a peer has
@@ -253,8 +260,11 @@ where
     /// Event hook for events received from the discovery service.
     fn on_discovery_event(&mut self, event: DiscoveryEvent) {
         match event {
-            DiscoveryEvent::Discovered(node, addr) => {
-                self.peers_manager.add_discovered_node(node, addr);
+            DiscoveryEvent::Discovered(peer, addr) => {
+                self.peers_manager.add_discovered_node(peer, addr);
+            }
+            DiscoveryEvent::EnrForkId(peer, fork_id) => {
+                self.peers_manager.set_discovered_fork_id(peer, fork_id);
             }
         }
     }
@@ -353,10 +363,6 @@ where
                     FetchAction::BlockRequest { peer_id, request } => {
                         self.handle_block_request(peer_id, request)
                     }
-                    FetchAction::StatusUpdate(status) => {
-                        // we want to return this directly
-                        return Poll::Ready(StateAction::StatusUpdate(status))
-                    }
                 }
             }
 
@@ -427,8 +433,6 @@ pub(crate) struct ActivePeer {
 
 /// Message variants triggered by the [`State`]
 pub(crate) enum StateAction {
-    /// Received a node status update.
-    StatusUpdate(StatusUpdate),
     /// Dispatch a `NewBlock` message to the peer
     NewBlock {
         /// Target of the message

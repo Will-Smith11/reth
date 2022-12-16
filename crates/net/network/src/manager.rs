@@ -35,7 +35,7 @@ use futures::{Future, StreamExt};
 use parking_lot::Mutex;
 use reth_eth_wire::{
     capability::{Capabilities, CapabilityMessage},
-    DisconnectReason,
+    DisconnectReason, Status,
 };
 use reth_primitives::{PeerId, H256};
 use reth_provider::BlockProvider;
@@ -62,19 +62,23 @@ use tracing::{error, info, trace, warn};
 ///  graph TB
 ///    handle(NetworkHandle)
 ///    events(NetworkEvents)
-///    transactions[(Transactions Task)]
+///    transactions(Transactions Task)
+///    ethrequest(ETH Request Task)
+///    discovery(Discovery Task)
 ///    subgraph NetworkManager
 ///      direction LR
 ///      subgraph Swarm
 ///          direction TB
-///          B1[(Peer Sessions)]
+///          B1[(Session Manager)]
 ///          B2[(Connection Lister)]
-///          B3[(State)]
+///          B3[(Network State)]
 ///      end
-///    end
-///   handle <--> |request/response channel| NetworkManager
+///   end
+///   handle <--> |request response channel| NetworkManager
 ///   NetworkManager --> |Network events| events
-///   transactions --> |propagate transactions| NetworkManager
+///   transactions <--> |transactions| NetworkManager
+///   ethrequest <--> |ETH request handing| NetworkManager
+///   discovery --> |Discovered peers| NetworkManager
 /// ```
 #[must_use = "The NetworkManager does nothing unless polled"]
 pub struct NetworkManager<C> {
@@ -147,6 +151,7 @@ where
             executor,
             hello_message,
             status,
+            fork_filter,
             ..
         } = config;
 
@@ -158,12 +163,20 @@ where
 
         // merge configured boot nodes
         discovery_v4_config.bootstrap_nodes.extend(boot_nodes.clone());
+        discovery_v4_config.add_eip868_pair("eth", status.forkid);
+
         let discovery = Discovery::new(discovery_addr, secret_key, discovery_v4_config).await?;
         // need to retrieve the addr here since provided port could be `0`
         let local_peer_id = discovery.local_id();
 
-        let sessions =
-            SessionManager::new(secret_key, sessions_config, executor, status, hello_message);
+        let sessions = SessionManager::new(
+            secret_key,
+            sessions_config,
+            executor,
+            status,
+            hello_message,
+            fork_filter,
+        );
         let state = NetworkState::new(client, discovery, peers_manger, genesis_hash);
 
         let swarm = Swarm::new(incoming, sessions, state);
@@ -456,6 +469,9 @@ where
             NetworkHandleMessage::FetchClient(tx) => {
                 let _ = tx.send(self.fetch_client());
             }
+            NetworkHandleMessage::StatusUpdate { height, hash, total_difficulty } => {
+                self.swarm.sessions_mut().on_status_update(height, hash, total_difficulty);
+            }
         }
     }
 }
@@ -515,6 +531,7 @@ where
                     remote_addr,
                     capabilities,
                     messages,
+                    status,
                     direction,
                 } => {
                     let total_active = this.num_active_peers.fetch_add(1, Ordering::Relaxed) + 1;
@@ -536,6 +553,7 @@ where
                     this.event_listeners.send(NetworkEvent::SessionEstablished {
                         peer_id,
                         capabilities,
+                        status,
                         messages,
                     });
                 }
@@ -612,14 +630,6 @@ where
                         .peers_mut()
                         .apply_reputation_change(&peer_id, ReputationChangeKind::FailedToConnect);
                 }
-                SwarmEvent::StatusUpdate(status) => {
-                    trace!(
-                        target : "net",
-                        ?status,
-                        "Status Update received"
-                    );
-                    this.swarm.sessions_mut().on_status_update(status.clone())
-                }
             }
         }
 
@@ -646,6 +656,8 @@ pub enum NetworkEvent {
         capabilities: Arc<Capabilities>,
         /// A request channel to the session task.
         messages: PeerRequestSender,
+        /// The status of the peer to which a session was established.
+        status: Status,
     },
 }
 

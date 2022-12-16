@@ -5,7 +5,7 @@ use crate::{
 use futures::StreamExt;
 use reth_eth_wire::{error::EthStreamError, DisconnectReason};
 use reth_net_common::ban_list::BanList;
-use reth_primitives::PeerId;
+use reth_primitives::{ForkId, PeerId};
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     fmt::Display,
@@ -15,14 +15,14 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{Instant, Interval},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// A communication channel to the [`PeersManager`] to apply manual changes to the peer set.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PeersHandle {
     /// Sender half of command channel back to the [`PeersManager`]
     manager_tx: mpsc::UnboundedSender<PeerCommand>,
@@ -48,6 +48,14 @@ impl PeersHandle {
     /// Send a reputation change for the given peer.
     pub fn reputation_change(&self, peer_id: PeerId, kind: ReputationChangeKind) {
         self.send(PeerCommand::ReputationChange(peer_id, kind));
+    }
+
+    /// Returns a peer by its [`PeerId`], or `None` if the peer is not in the peer set.
+    pub async fn peer_by_id(&self, peer_id: PeerId) -> Option<Peer> {
+        let (tx, rx) = oneshot::channel();
+        self.send(PeerCommand::GetPeer(peer_id, tx));
+
+        rx.await.unwrap_or(None)
     }
 }
 
@@ -169,10 +177,13 @@ impl PeersManager {
     pub(crate) fn apply_reputation_change(&mut self, peer_id: &PeerId, rep: ReputationChangeKind) {
         let reputation_change = self.reputation_weights.change(rep);
         let should_disconnect = if let Some(mut peer) = self.peers.get_mut(peer_id) {
-            peer.reputation = peer.reputation.saturating_sub(reputation_change.as_i32());
+            // we add reputation since negative reputation change decrease total reputation
+            peer.reputation = peer.reputation.saturating_add(reputation_change.as_i32());
+            trace!(target: "net::peers", repuation=%peer.reputation, banned=%peer.is_banned(), "applied reputation change");
             let should_disconnect = peer.state.is_connected() && peer.is_banned();
 
             if should_disconnect {
+                debug!(target: "net::peers", repuation=%peer.reputation, "disconnecting peer on reputation change");
                 peer.state.disconnect();
             }
 
@@ -232,6 +243,17 @@ impl PeersManager {
         self.fill_outbound_slots();
     }
 
+    /// Called as follow-up for a discovered peer.
+    ///
+    /// The [`ForkId`] is retrieved from an ENR record that the peer announces over the discovery
+    /// protocol
+    pub(crate) fn set_discovered_fork_id(&mut self, peer_id: PeerId, fork_id: ForkId) {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            trace!(target : "net::peers", ?peer_id, ?fork_id, "set discovered fork id");
+            peer.fork_id = Some(fork_id);
+        }
+    }
+
     /// Called for a newly discovered peer.
     ///
     /// If the peer already exists, then the address will be updated. If the addresses differ, the
@@ -270,6 +292,8 @@ impl PeersManager {
 
     /// Returns the idle peer with the highest reputation.
     ///
+    /// Peers with a `forkId` are considered better than peers without.
+    ///
     /// Returns `None` if no peer is available.
     fn best_unconnected(&mut self) -> Option<(PeerId, &mut Peer)> {
         let mut unconnected = self.peers.iter_mut().filter(|(_, peer)| peer.state.is_unconnected());
@@ -278,8 +302,18 @@ impl PeersManager {
         let mut best_peer = unconnected.next()?;
 
         for maybe_better in unconnected {
-            if maybe_better.1.reputation > best_peer.1.reputation {
-                best_peer = maybe_better;
+            match (maybe_better.1.fork_id.as_ref(), best_peer.1.fork_id.as_ref()) {
+                (Some(_), Some(_)) | (None, None) => {
+                    if maybe_better.1.reputation > best_peer.1.reputation {
+                        best_peer = maybe_better;
+                    }
+                }
+                (Some(_), None) => {
+                    if !maybe_better.1.is_banned() {
+                        best_peer = maybe_better;
+                    }
+                }
+                _ => {}
             }
         }
         Some((*best_peer.0, best_peer.1))
@@ -334,6 +368,9 @@ impl PeersManager {
                     PeerCommand::Remove(peer) => self.remove_discovered_node(peer),
                     PeerCommand::ReputationChange(peer_id, rep) => {
                         self.apply_reputation_change(&peer_id, rep)
+                    }
+                    PeerCommand::GetPeer(peer, tx) => {
+                        let _ = tx.send(self.peers.get(&peer).cloned());
                     }
                 }
             }
@@ -406,14 +443,17 @@ impl Default for ConnectionInfo {
     }
 }
 
+#[derive(Debug, Clone)]
 /// Tracks info about a single peer.
-struct Peer {
+pub struct Peer {
     /// Where to reach the peer
     addr: SocketAddr,
     /// Reputation of the peer.
     reputation: i32,
     /// The state of the connection, if any.
     state: PeerConnectionState,
+    /// The [`ForkId`] that the peer announced via discovery.
+    fork_id: Option<ForkId>,
 }
 
 // === impl Peer ===
@@ -424,7 +464,7 @@ impl Peer {
     }
 
     fn with_state(addr: SocketAddr, state: PeerConnectionState) -> Self {
-        Self { addr, state, reputation: 0 }
+        Self { addr, state, reputation: 0, fork_id: None }
     }
 
     /// Returns true if the peer's reputation is below the banned threshold.
@@ -486,6 +526,8 @@ pub(crate) enum PeerCommand {
     Remove(PeerId),
     /// Apply a reputation change to the given peer.
     ReputationChange(PeerId, ReputationChangeKind),
+    /// Get information about a peer
+    GetPeer(PeerId, oneshot::Sender<Option<Peer>>),
 }
 
 /// Actions the peer manager can trigger.
@@ -513,7 +555,7 @@ pub enum PeerAction {
 /// Config type for initiating a [`PeersManager`] instance
 #[derive(Debug)]
 pub struct PeersConfig {
-    /// How even to recheck free slots for outbound connections
+    /// How often to recheck free slots for outbound connections
     pub refill_slots_interval: Duration,
     /// Restrictions on connections
     pub connection_info: ConnectionInfo,
