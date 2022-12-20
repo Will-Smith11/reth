@@ -52,7 +52,7 @@ pub struct HeaderStage<D: HeaderDownloader, C: Consensus, H: HeadersClient, S: S
     /// Network handle for updating status
     pub network_handle: S,
     /// The number of block headers to commit at once
-    pub commit_threshold: usize,
+    pub commit_threshold: u64,
 }
 
 #[async_trait::async_trait]
@@ -76,15 +76,11 @@ impl<DB: Database, D: HeaderDownloader, C: Consensus, H: HeadersClient, S: Statu
 
         // Lookup the head and tip of the sync range
         let (head, tip) = self.get_head_and_tip(tx, stage_progress).await?;
-        debug!(
-            target: "sync::stages::headers",
-            "Syncing from tip {:?} to head {:?}",
-            tip,
-            head.hash()
-        );
+        debug!(target: "sync::stages::headers", ?tip, head = ?head.hash(), "Commencing sync");
 
         let mut current_progress = stage_progress;
-        let mut stream = self.downloader.stream(head.clone(), tip).chunks(self.commit_threshold);
+        let mut stream =
+            self.downloader.stream(head.clone(), tip).chunks(self.commit_threshold as usize);
 
         // The stage relies on the downloader to return the headers
         // in descending order starting from the tip down to
@@ -92,40 +88,25 @@ impl<DB: Database, D: HeaderDownloader, C: Consensus, H: HeadersClient, S: Statu
         while let Some(headers) = stream.next().await {
             match headers.into_iter().collect::<Result<Vec<_>, _>>() {
                 Ok(res) => {
-                    info!(
-                        target: "sync::stages::headers",
-                        len = res.len(),
-                        "Received headers"
-                    );
+                    info!(target: "sync::stages::headers", len = res.len(), "Received headers");
 
                     // Perform basic response validation
                     self.validate_header_response(&res)?;
                     let write_progress =
                         self.write_headers::<DB>(tx, res).await?.unwrap_or_default();
-                    tx.commit()?;
                     current_progress = current_progress.max(write_progress);
                 }
                 Err(e) => match e {
                     DownloadError::Timeout => {
-                        warn!(
-                            target: "sync::stages::headers",
-                            "No response for header request"
-                        );
+                        warn!(target: "sync::stages::headers", "No response for header request");
                         return Err(StageError::Recoverable(DownloadError::Timeout.into()))
                     }
                     DownloadError::HeaderValidation { hash, error } => {
-                        error!(
-                            target: "sync::stages::headers",
-                            "Validation error for header {hash}: {error}"
-                        );
+                        error!(target: "sync::stages::headers", ?error, ?hash, "Validation error");
                         return Err(StageError::Validation { block: stage_progress, error })
                     }
                     error => {
-                        error!(
-                            target: "sync::stages::headers",
-                            ?error,
-                            "An unexpected error occurred"
-                        );
+                        error!(target: "sync::stages::headers", ?error, "Unexpected error");
                         return Err(StageError::Recoverable(error.into()))
                     }
                 },
@@ -133,6 +114,7 @@ impl<DB: Database, D: HeaderDownloader, C: Consensus, H: HeadersClient, S: Statu
         }
 
         // Write total difficulty values after all headers have been inserted
+        debug!(target: "sync::stages::headers", head = ?head.hash(), "Writing total difficulty");
         self.write_td::<DB>(tx, &head)?;
 
         let stage_progress = current_progress.max(
@@ -142,7 +124,7 @@ impl<DB: Database, D: HeaderDownloader, C: Consensus, H: HeadersClient, S: Statu
                 .unwrap_or_default(),
         );
 
-        Ok(ExecOutput { stage_progress, reached_tip: true, done: true })
+        Ok(ExecOutput { stage_progress, done: true })
     }
 
     /// Unwind the stage.
@@ -403,7 +385,7 @@ mod tests {
         let result = rx.await.unwrap();
         assert_matches!(
             result,
-            Ok(ExecOutput { done: true, reached_tip: true, stage_progress })
+            Ok(ExecOutput { done: true, stage_progress })
                 if stage_progress == tip.number
         );
         assert!(runner.validate_execution(input, result.ok()).is_ok(), "validation failed");

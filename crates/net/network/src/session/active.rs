@@ -12,7 +12,7 @@ use futures::{stream::Fuse, SinkExt, StreamExt};
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::{
     capability::Capabilities,
-    error::{EthStreamError, HandshakeError},
+    error::{EthStreamError, HandshakeError, P2PStreamError},
     message::{EthBroadcastMessage, RequestPair},
     DisconnectReason, EthMessage, EthStream, P2PStream,
 };
@@ -290,8 +290,22 @@ impl ActiveSession {
     }
 
     /// Starts the disconnect process
-    fn start_disconnect(&mut self, reason: DisconnectReason) {
-        self.conn.inner_mut().start_disconnect(reason);
+    fn start_disconnect(&mut self, reason: DisconnectReason) -> Result<(), EthStreamError> {
+        self.conn
+            .inner_mut()
+            .start_disconnect(reason)
+            .map_err(P2PStreamError::from)
+            .map_err(Into::into)
+    }
+
+    /// Flushes the disconnect message and emits the corresponding message
+    fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        debug_assert!(self.is_disconnecting(), "not disconnecting");
+
+        // try to close the flush out the remaining Disconnect message
+        let _ = ready!(self.conn.poll_close_unpin(cx));
+        self.emit_disconnect();
+        Poll::Ready(())
     }
 
     /// Removes all timed out requests
@@ -317,10 +331,7 @@ impl Future for ActiveSession {
         let this = self.get_mut();
 
         if this.is_disconnecting() {
-            // try to close the flush out the remaining Disconnect message
-            let _ = ready!(this.conn.poll_close_unpin(cx));
-            this.emit_disconnect();
-            return Poll::Ready(())
+            return this.poll_disconnect(cx)
         }
 
         loop {
@@ -341,7 +352,18 @@ impl Future for ActiveSession {
                             SessionCommand::Disconnect { reason } => {
                                 let reason =
                                     reason.unwrap_or(DisconnectReason::DisconnectRequested);
-                                this.start_disconnect(reason);
+                                // try to disconnect
+                                match this.start_disconnect(reason) {
+                                    Ok(()) => {
+                                        // we're done
+                                        return this.poll_disconnect(cx)
+                                    }
+                                    Err(err) => {
+                                        error!(target: "net::session", ?err, remote_peer_id=?this.remote_peer_id, "could not send disconnect");
+                                        this.close_on_error(err);
+                                        return Poll::Ready(())
+                                    }
+                                }
                             }
                             SessionCommand::Message(msg) => {
                                 this.on_peer_message(msg);
@@ -430,8 +452,10 @@ impl Future for ActiveSession {
             }
 
             if !progress {
-                // check for timed out requests
-                this.evict_timed_out_requests(Instant::now());
+                if this.timeout_interval.poll_tick(cx).is_ready() {
+                    // check for timed out requests
+                    this.evict_timed_out_requests(Instant::now());
+                }
 
                 return Poll::Pending
             }
@@ -652,7 +676,7 @@ mod tests {
             let (incoming, _) = listener.accept().await.unwrap();
             let mut session = builder.connect_incoming(incoming).await;
 
-            session.start_disconnect(expected_disconnect);
+            session.start_disconnect(expected_disconnect).unwrap();
             session.await
         });
 
@@ -729,7 +753,7 @@ mod tests {
         let local_addr = listener.local_addr().unwrap();
 
         let fut = builder.with_client_stream(local_addr, move |mut client_stream| async move {
-            let _ = tokio::time::timeout(Duration::from_secs(60), client_stream.next()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(25), client_stream.next()).await;
             client_stream.into_inner().disconnect(DisconnectReason::UselessPeer).await.unwrap();
         });
 
