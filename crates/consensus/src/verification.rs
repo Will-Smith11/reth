@@ -2,8 +2,8 @@
 use crate::{config, Config};
 use reth_interfaces::{consensus::Error, Result as RethResult};
 use reth_primitives::{
-    BlockLocked, BlockNumber, Header, SealedHeader, Transaction, TransactionSignedEcRecovered,
-    TxEip1559, TxEip2930, TxLegacy, EMPTY_OMMER_ROOT, H256, U256,
+    BlockNumber, Header, SealedBlock, SealedHeader, Transaction, TransactionSignedEcRecovered,
+    TxEip1559, TxEip2930, TxLegacy, EMPTY_OMMER_ROOT, U256,
 };
 use reth_provider::{AccountProvider, HeaderProvider};
 use std::{
@@ -45,7 +45,7 @@ pub fn validate_header_standalone(
     // EIP-3675: Upgrade consensus to Proof-of-Stake:
     // https://eips.ethereum.org/EIPS/eip-3675#replacing-difficulty-with-0
     if header.number >= config.paris_block {
-        if header.difficulty != U256::zero() {
+        if header.difficulty != U256::ZERO {
             return Err(Error::TheMergeDifficultyIsNotZero)
         }
 
@@ -57,9 +57,8 @@ pub fn validate_header_standalone(
             return Err(Error::TheMergeOmmerRootIsNotEmpty)
         }
 
-        if header.mix_hash != H256::zero() {
-            return Err(Error::TheMergeMixHashIsNotZero)
-        }
+        // mixHash is used instead of difficulty inside EVM
+        // https://eips.ethereum.org/EIPS/eip-4399#using-mixhash-field-instead-of-difficulty
     }
 
     Ok(())
@@ -182,7 +181,7 @@ pub fn validate_all_transaction_regarding_block_and_nonces<
 /// - Compares the transactions root in the block header to the block body
 /// - Pre-execution transaction validation
 /// - (Optionally) Compares the receipts root in the block header to the block body
-pub fn validate_block_standalone(block: &BlockLocked) -> Result<(), Error> {
+pub fn validate_block_standalone(block: &SealedBlock) -> Result<(), Error> {
     // Check ommers hash
     // TODO(onbjerg): This should probably be accessible directly on [Block]
     let ommers_hash =
@@ -313,7 +312,7 @@ pub fn validate_header_regarding_parent(
 ///
 /// Returns parent block header  
 pub fn validate_block_regarding_chain<PROV: HeaderProvider>(
-    block: &BlockLocked,
+    block: &SealedBlock,
     provider: &PROV,
 ) -> RethResult<SealedHeader> {
     let hash = block.header.hash();
@@ -334,7 +333,7 @@ pub fn validate_block_regarding_chain<PROV: HeaderProvider>(
 
 /// Full validation of block before execution.
 pub fn full_validation<Provider: HeaderProvider + AccountProvider>(
-    block: &BlockLocked,
+    block: &SealedBlock,
     provider: Provider,
     config: &Config,
 ) -> RethResult<()> {
@@ -431,6 +430,10 @@ mod tests {
         fn header_by_number(&self, _num: u64) -> Result<Option<Header>> {
             Ok(self.parent.clone())
         }
+
+        fn header_td(&self, _hash: &BlockHash) -> Result<Option<U256>> {
+            Ok(None)
+        }
     }
 
     fn mock_tx(nonce: u64) -> TransactionSignedEcRecovered {
@@ -452,7 +455,7 @@ mod tests {
         TransactionSignedEcRecovered::from_signed_transaction(tx, signer)
     }
     /// got test block
-    fn mock_block() -> (BlockLocked, Header) {
+    fn mock_block() -> (SealedBlock, Header) {
         // https://etherscan.io/block/15867168 where transaction root and receipts root are cleared
         // empty merkle tree: 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
 
@@ -464,7 +467,7 @@ mod tests {
             transactions_root: hex!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").into(),
             receipts_root: hex!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").into(),
             logs_bloom: hex!("002400000000004000220000800002000000000000000000000000000000100000000000000000100000000000000021020000000800000006000000002100040000000c0004000000000008000008200000000000000000000000008000000001040000020000020000002000000800000002000020000000022010000000000000010002001000000000020200000000000001000200880000004000000900020000000000020000000040000000000000000000000000000080000000000001000002000000000000012000200020000000000000001000000000000020000010321400000000100000000000000000000000000000400000000000000000").into(),
-            difficulty: 0x00.into(), // total difficulty: 0xc70d815d562d3cfa955).into(),
+            difficulty: U256::ZERO, // total difficulty: 0xc70d815d562d3cfa955).into(),
             number: 0xf21d20,
             gas_limit: 0x1c9c380,
             gas_used: 0x6e813,
@@ -485,7 +488,7 @@ mod tests {
         let ommers = Vec::new();
         let body = Vec::new();
 
-        (BlockLocked { header: header.seal(), body, ommers }, parent)
+        (SealedBlock { header: header.seal(), body, ommers }, parent)
     }
 
     #[test]

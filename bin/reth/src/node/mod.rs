@@ -4,31 +4,28 @@
 use crate::{
     config::Config,
     dirs::{ConfigPath, DbPath},
-    util::chainspec::{chain_spec_value_parser, ChainSpecification, Genesis},
+    prometheus_exporter,
+    util::{
+        chainspec::{chain_spec_value_parser, ChainSpecification},
+        init::{init_db, init_genesis},
+    },
+    NetworkOpts,
 };
 use clap::{crate_version, Parser};
-use eyre::WrapErr;
-use metrics_exporter_prometheus::PrometheusBuilder;
-use metrics_util::layers::{PrefixLayer, Stack};
-use reth_consensus::EthConsensus;
-use reth_db::{
-    cursor::DbCursorRO,
-    database::Database,
-    mdbx::{Env, WriteMap},
-    tables,
-    transaction::{DbTx, DbTxMut},
-};
+use fdlimit::raise_fd_limit;
+use reth_consensus::BeaconConsensus;
 use reth_downloaders::{bodies, headers};
+use reth_executor::Config as ExecutorConfig;
 use reth_interfaces::consensus::ForkchoiceState;
-use reth_network::{
-    config::{mainnet_nodes, rng_secret_key},
-    error::NetworkError,
-    NetworkConfig, NetworkHandle, NetworkManager,
+use reth_primitives::H256;
+use reth_stages::{
+    metrics::HeaderMetrics,
+    stages::{
+        bodies::BodyStage, execution::ExecutionStage, headers::HeaderStage,
+        sender_recovery::SenderRecoveryStage, total_difficulty::TotalDifficultyStage,
+    },
 };
-use reth_primitives::{Account, Header, H256};
-use reth_provider::{db_provider::ProviderImpl, BlockProvider, HeaderProvider};
-use reth_stages::stages::{bodies::BodyStage, headers::HeaderStage, senders::SendersStage};
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tracing::{debug, info};
 
 /// Start the client
@@ -76,13 +73,27 @@ pub struct Command {
     /// NOTE: This is a temporary flag
     #[arg(long = "debug.tip")]
     tip: Option<H256>,
+
+    #[clap(flatten)]
+    network: NetworkOpts,
 }
 
 impl Command {
     /// Execute `node` command
     // TODO: RPC
     pub async fn execute(&self) -> eyre::Result<()> {
-        let config: Config = confy::load_path(&self.config)?;
+        // Raise the fd limit of the process.
+        // Does not do anything on windows.
+        raise_fd_limit();
+
+        let mut config: Config = confy::load_path(&self.config).unwrap_or_default();
+        config.peers.connect_trusted_nodes_only = self.network.trusted_only;
+        if !self.network.trusted_peers.is_empty() {
+            self.network.trusted_peers.iter().for_each(|peer| {
+                config.peers.trusted_nodes.insert(*peer);
+            });
+        }
+
         info!("reth {} starting", crate_version!());
 
         info!("Opening database at {}", &self.db);
@@ -91,29 +102,27 @@ impl Command {
 
         if let Some(listen_addr) = self.metrics {
             info!("Starting metrics endpoint at {}", listen_addr);
-            let (recorder, exporter) = PrometheusBuilder::new()
-                .with_http_listener(listen_addr)
-                .build()
-                .wrap_err("Could not build Prometheus endpoint.")?;
-            tokio::task::spawn(exporter);
-            Stack::new(recorder)
-                .push(PrefixLayer::new("reth"))
-                .install()
-                .wrap_err("Couldn't set metrics recorder.")?;
+            prometheus_exporter::initialize(listen_addr)?;
+            HeaderMetrics::describe();
         }
 
         let chain_id = self.chain.consensus.chain_id;
-        let consensus = Arc::new(EthConsensus::new(self.chain.consensus.clone()));
+        let consensus = Arc::new(BeaconConsensus::new(self.chain.consensus.clone()));
         let genesis_hash = init_genesis(db.clone(), self.chain.genesis.clone())?;
 
-        info!("Connecting to p2p");
-        let network = start_network(network_config(db.clone(), chain_id, genesis_hash)).await?;
+        let network = config
+            .network_config(db.clone(), chain_id, genesis_hash, self.network.disable_discovery)
+            .start_network()
+            .await?;
+
+        info!(peer_id = ?network.peer_id(), local_addr = %network.local_addr(), "Started p2p networking");
 
         // TODO: Are most of these Arcs unnecessary? For example, fetch client is completely
         // cloneable on its own
         // TODO: Remove magic numbers
         let fetch_client = Arc::new(network.fetch_client().await?);
-        let mut pipeline = reth_stages::Pipeline::new()
+        let mut pipeline = reth_stages::Pipeline::default()
+            .with_sync_state_updater(network.clone())
             .push(HeaderStage {
                 downloader: headers::linear::LinearDownloadBuilder::default()
                     .batch_size(config.stages.headers.downloader_batch_size)
@@ -123,6 +132,10 @@ impl Command {
                 client: fetch_client.clone(),
                 network_handle: network.clone(),
                 commit_threshold: config.stages.headers.commit_threshold,
+                metrics: HeaderMetrics::default(),
+            })
+            .push(TotalDifficultyStage {
+                commit_threshold: config.stages.total_difficulty.commit_threshold,
             })
             .push(BodyStage {
                 downloader: Arc::new(
@@ -137,9 +150,13 @@ impl Command {
                 consensus: consensus.clone(),
                 commit_threshold: config.stages.bodies.commit_threshold,
             })
-            .push(SendersStage {
-                batch_size: config.stages.senders.batch_size,
-                commit_threshold: config.stages.senders.commit_threshold,
+            .push(SenderRecoveryStage {
+                batch_size: config.stages.sender_recovery.batch_size,
+                commit_threshold: config.stages.sender_recovery.commit_threshold,
+            })
+            .push(ExecutionStage {
+                config: ExecutorConfig::new_ethereum(),
+                commit_threshold: config.stages.execution.commit_threshold,
             });
 
         if let Some(tip) = self.tip {
@@ -158,80 +175,4 @@ impl Command {
         info!("Finishing up");
         Ok(())
     }
-}
-
-/// Opens up an existing database or creates a new one at the specified path.
-fn init_db<P: AsRef<Path>>(path: P) -> eyre::Result<Env<WriteMap>> {
-    std::fs::create_dir_all(path.as_ref())?;
-    let db = reth_db::mdbx::Env::<reth_db::mdbx::WriteMap>::open(
-        path.as_ref(),
-        reth_db::mdbx::EnvKind::RW,
-    )?;
-    db.create_tables()?;
-
-    Ok(db)
-}
-
-/// Write the genesis block if it has not already been written
-#[allow(clippy::field_reassign_with_default)]
-fn init_genesis<DB: Database>(db: Arc<DB>, genesis: Genesis) -> Result<H256, reth_db::Error> {
-    let tx = db.tx_mut()?;
-    if let Some((_, hash)) = tx.cursor::<tables::CanonicalHeaders>()?.first()? {
-        debug!("Genesis already written, skipping.");
-        return Ok(hash)
-    }
-    debug!("Writing genesis block.");
-
-    // Insert account state
-    for (address, account) in &genesis.alloc {
-        tx.put::<tables::PlainAccountState>(
-            *address,
-            Account {
-                nonce: account.nonce.unwrap_or_default(),
-                balance: account.balance,
-                bytecode_hash: None,
-            },
-        )?;
-    }
-
-    // Insert header
-    let header: Header = genesis.into();
-    let hash = header.hash_slow();
-    tx.put::<tables::CanonicalHeaders>(0, hash)?;
-    tx.put::<tables::HeaderNumbers>(hash, 0)?;
-    tx.put::<tables::BlockBodies>((0, hash).into(), Default::default())?;
-    tx.put::<tables::BlockTransitionIndex>((0, hash).into(), 0)?;
-    tx.put::<tables::HeaderTD>((0, hash).into(), header.difficulty.into())?;
-    tx.put::<tables::Headers>((0, hash).into(), header)?;
-
-    tx.commit()?;
-    Ok(hash)
-}
-
-// TODO: This should be based on some external config
-fn network_config<DB: Database>(
-    db: Arc<DB>,
-    chain_id: u64,
-    genesis_hash: H256,
-) -> NetworkConfig<ProviderImpl<DB>> {
-    NetworkConfig::builder(Arc::new(ProviderImpl::new(db)), rng_secret_key())
-        .boot_nodes(mainnet_nodes())
-        .genesis_hash(genesis_hash)
-        .chain_id(chain_id)
-        .build()
-}
-
-/// Starts the networking stack given a [NetworkConfig] and returns a handle to the network.
-async fn start_network<C>(config: NetworkConfig<C>) -> Result<NetworkHandle, NetworkError>
-where
-    C: BlockProvider + HeaderProvider + 'static,
-{
-    let client = config.client.clone();
-    let (handle, network, _txpool, eth) =
-        NetworkManager::builder(config).await?.request_handler(client).split_with_handle();
-
-    tokio::task::spawn(network);
-    // TODO: tokio::task::spawn(txpool);
-    tokio::task::spawn(eth);
-    Ok(handle)
 }

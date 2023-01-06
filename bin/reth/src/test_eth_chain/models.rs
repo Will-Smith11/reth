@@ -21,7 +21,7 @@ pub struct BlockchainTestData {
     /// Blocks.
     pub blocks: Vec<Block>,
     /// Post state.
-    pub post_state: Option<State>,
+    pub post_state: Option<RootOrState>,
     /// Pre state.
     pub pre: State,
     /// Hash of best block.
@@ -77,16 +77,16 @@ impl From<Header> for SealedHeader {
     fn from(value: Header) -> Self {
         SealedHeader::new(
             RethHeader {
-                base_fee_per_gas: value.base_fee_per_gas.map(|v| v.0.as_u64()),
+                base_fee_per_gas: value.base_fee_per_gas.map(|v| v.0.to::<u64>()),
                 beneficiary: value.coinbase,
                 difficulty: value.difficulty.0,
                 extra_data: value.extra_data.0,
-                gas_limit: value.gas_limit.0.as_u64(),
-                gas_used: value.gas_used.0.as_u64(),
+                gas_limit: value.gas_limit.0.to::<u64>(),
+                gas_used: value.gas_used.0.to::<u64>(),
                 mix_hash: value.mix_hash,
                 nonce: value.nonce.into_uint().as_u64(),
-                number: value.number.0.as_u64(),
-                timestamp: value.timestamp.0.as_u64(),
+                number: value.number.0.to::<u64>(),
+                timestamp: value.timestamp.0.to::<u64>(),
                 transactions_root: value.transactions_trie,
                 receipts_root: value.receipt_trie,
                 ommers_hash: value.uncle_hash,
@@ -112,6 +112,18 @@ pub struct Block {
     pub transactions: Option<Vec<Transaction>>,
     /// Uncle/ommer headers
     pub uncle_headers: Option<Vec<Header>>,
+    /// Transaction Sequence
+    pub transaction_sequence: Option<Vec<TransactionSequence>>,
+}
+
+/// Transaction Sequence in block
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionSequence {
+    exception: String,
+    raw_bytes: Bytes,
+    valid: String,
 }
 
 /// Ethereum blockchain test data State.
@@ -185,12 +197,17 @@ pub enum ForkSpec {
     London,
     /// Paris aka The Merge
     Merge,
+    /// Shanghai
+    Shanghai,
     /// Merge EOF test
     #[serde(alias = "Merge+3540+3670")]
     MergeEOF,
     /// After Merge Init Code test
     #[serde(alias = "Merge+3860")]
     MergeMeterInitCode,
+    /// After Merge plus new PUSH0 opcode
+    #[serde(alias = "Merge+3855")]
+    MergePush0,
 }
 
 impl From<ForkSpec> for reth_executor::SpecUpgrades {
@@ -214,6 +231,10 @@ impl From<ForkSpec> for reth_executor::SpecUpgrades {
             ForkSpec::Merge => Self::new_paris_activated(),
             ForkSpec::MergeEOF => Self::new_paris_activated(),
             ForkSpec::MergeMeterInitCode => Self::new_paris_activated(),
+            ForkSpec::MergePush0 => Self::new_paris_activated(),
+            ForkSpec::Shanghai => {
+                panic!("Not supported")
+            }
             ForkSpec::ByzantiumToConstantinopleAt5 | ForkSpec::Constantinople => {
                 panic!("Overriden with PETERSBURG")
             }

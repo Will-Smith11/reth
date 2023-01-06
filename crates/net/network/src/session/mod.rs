@@ -1,5 +1,4 @@
 //! Support for handling peer sessions.
-pub use crate::message::PeerRequestSender;
 use crate::{
     message::PeerMessage,
     session::{
@@ -11,15 +10,18 @@ use crate::{
         },
     },
 };
+pub use crate::{message::PeerRequestSender, session::handle::PeerInfo};
 use fnv::FnvHashMap;
 use futures::{future::Either, io, FutureExt, StreamExt};
-use reth_ecies::stream::ECIESStream;
+use reth_ecies::{stream::ECIESStream, ECIESError};
 use reth_eth_wire::{
     capability::{Capabilities, CapabilityMessage},
-    error::EthStreamError,
+    errors::EthStreamError,
     DisconnectReason, HelloMessage, Status, UnauthedEthStream, UnauthedP2PStream,
 };
-use reth_primitives::{ForkFilter, ForkTransition, PeerId, H256, U256};
+use reth_net_common::bandwidth_meter::{BandwidthMeter, MeteredStream};
+use reth_primitives::{ForkFilter, ForkId, ForkTransition, PeerId, H256, U256};
+use reth_tasks::TaskExecutor;
 use secp256k1::SecretKey;
 use std::{
     collections::HashMap,
@@ -40,10 +42,6 @@ mod active;
 mod config;
 mod handle;
 pub use config::SessionsConfig;
-use reth_ecies::ECIESError;
-
-use crate::error::error_merits_discovery_ban;
-use reth_tasks::TaskExecutor;
 
 /// Internal identifier for active sessions.
 #[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, Hash)]
@@ -91,6 +89,8 @@ pub(crate) struct SessionManager {
     active_session_tx: mpsc::Sender<ActiveSessionMessage>,
     /// Receiver half that listens for [`ActiveSessionEvent`] produced by pending sessions.
     active_session_rx: ReceiverStream<ActiveSessionMessage>,
+    /// Used to measure inbound & outbound bandwidth across all managed streams
+    bandwidth_meter: BandwidthMeter,
 }
 
 // === impl SessionManager ===
@@ -104,6 +104,7 @@ impl SessionManager {
         status: Status,
         hello_message: HelloMessage,
         fork_filter: ForkFilter,
+        bandwidth_meter: BandwidthMeter,
     ) -> Self {
         let (pending_sessions_tx, pending_sessions_rx) = mpsc::channel(config.session_event_buffer);
         let (active_session_tx, active_session_rx) = mpsc::channel(config.session_event_buffer);
@@ -124,7 +125,14 @@ impl SessionManager {
             pending_session_rx: ReceiverStream::new(pending_sessions_rx),
             active_session_tx,
             active_session_rx: ReceiverStream::new(active_session_rx),
+            bandwidth_meter,
         }
+    }
+
+    /// Check whether the provided [`ForkId`] is compatible based on the validation rules in
+    /// `EIP-2124`.
+    pub(crate) fn is_valid_fork_id(&self, fork_id: ForkId) -> bool {
+        self.fork_filter.validate(fork_id).is_ok()
     }
 
     /// Returns the next unique [`SessionId`].
@@ -183,10 +191,11 @@ impl SessionManager {
 
         let (disconnect_tx, disconnect_rx) = oneshot::channel();
         let pending_events = self.pending_sessions_tx.clone();
+        let metered_stream = MeteredStream::new_with_meter(stream, self.bandwidth_meter.clone());
         self.spawn(start_pending_incoming_session(
             disconnect_rx,
             session_id,
-            stream,
+            metered_stream,
             pending_events,
             remote_addr,
             self.secret_key,
@@ -217,6 +226,7 @@ impl SessionManager {
             self.hello_message.clone(),
             self.status,
             self.fork_filter.clone(),
+            self.bandwidth_meter.clone(),
         ));
 
         let handle = PendingSessionHandle {
@@ -311,7 +321,7 @@ impl SessionManager {
             Poll::Ready(None) => unreachable!("Manager holds both channel halves."),
             Poll::Ready(Some(event)) => event,
         };
-        return match event {
+        match event {
             PendingSessionEvent::Established {
                 session_id,
                 remote_addr,
@@ -320,6 +330,7 @@ impl SessionManager {
                 conn,
                 status,
                 direction,
+                client_id,
             } => {
                 // move from pending to established.
                 self.remove_pending_session(&session_id);
@@ -352,7 +363,7 @@ impl SessionManager {
 
                 let (to_session_tx, messages_rx) = mpsc::channel(self.session_command_buffer);
 
-                let messages = PeerRequestSender { peer_id, to_session_tx };
+                let messages = PeerRequestSender::new(peer_id, to_session_tx);
 
                 let session = ActiveSession {
                     next_id: 0,
@@ -380,6 +391,8 @@ impl SessionManager {
                     established: Instant::now(),
                     capabilities: Arc::clone(&capabilities),
                     commands_to_session,
+                    client_version: client_id,
+                    remote_addr,
                 };
 
                 self.active_sessions.insert(peer_id, handle);
@@ -464,6 +477,33 @@ impl SessionManager {
             }
         }
     }
+
+    /// Returns [`PeerInfo`] for all connected peers
+    pub(crate) fn get_peer_info(&self) -> Vec<PeerInfo> {
+        self.active_sessions
+            .values()
+            .map(|session| PeerInfo {
+                remote_id: session.remote_id,
+                direction: session.direction,
+                remote_addr: session.remote_addr,
+                capabilities: session.capabilities.clone(),
+                client_version: session.client_version.clone(),
+            })
+            .collect()
+    }
+
+    /// Returns [`PeerInfo`] for a given peer.
+    ///
+    /// Returns `None` if there's no active session to the peer.
+    pub(crate) fn get_peer_info_by_id(&self, peer_id: PeerId) -> Option<PeerInfo> {
+        self.active_sessions.get(&peer_id).map(|session| PeerInfo {
+            remote_id: session.remote_id,
+            direction: session.direction,
+            remote_addr: session.remote_addr,
+            capabilities: session.capabilities.clone(),
+            client_version: session.client_version.clone(),
+        })
+    }
 }
 
 /// Events produced by the [`SessionManager`]
@@ -544,19 +584,6 @@ pub(crate) enum PendingSessionHandshakeError {
     Ecies(ECIESError),
 }
 
-// === impl PendingSessionHandshakeError ===
-
-impl PendingSessionHandshakeError {
-    /// Returns true if the error indicates that the corresponding peer should be removed from peer
-    /// discover
-    pub(crate) fn merits_discovery_ban(&self) -> bool {
-        match self {
-            PendingSessionHandshakeError::Eth(eth) => error_merits_discovery_ban(eth),
-            PendingSessionHandshakeError::Ecies(_) => true,
-        }
-    }
-}
-
 /// The direction of the connection.
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum Direction {
@@ -586,7 +613,7 @@ pub struct ExceedsSessionLimit(pub(crate) u32);
 pub(crate) async fn start_pending_incoming_session(
     disconnect_rx: oneshot::Receiver<()>,
     session_id: SessionId,
-    stream: TcpStream,
+    stream: MeteredStream<TcpStream>,
     events: mpsc::Sender<PendingSessionEvent>,
     remote_addr: SocketAddr,
     secret_key: SecretKey,
@@ -622,9 +649,10 @@ async fn start_pending_outbound_session(
     hello: HelloMessage,
     status: Status,
     fork_filter: ForkFilter,
+    bandwidth_meter: BandwidthMeter,
 ) {
     let stream = match TcpStream::connect(remote_addr).await {
-        Ok(stream) => stream,
+        Ok(stream) => MeteredStream::new_with_meter(stream, bandwidth_meter),
         Err(error) => {
             let _ = events
                 .send(PendingSessionEvent::OutgoingConnectionError {
@@ -657,7 +685,7 @@ async fn start_pending_outbound_session(
 async fn authenticate(
     disconnect_rx: oneshot::Receiver<()>,
     events: mpsc::Sender<PendingSessionEvent>,
-    stream: TcpStream,
+    stream: MeteredStream<TcpStream>,
     session_id: SessionId,
     remote_addr: SocketAddr,
     secret_key: SecretKey,
@@ -733,7 +761,7 @@ async fn authenticate(
 /// On Success return the authenticated stream as [`PendingSessionEvent`]
 #[allow(clippy::too_many_arguments)]
 async fn authenticate_stream(
-    stream: UnauthedP2PStream<ECIESStream<TcpStream>>,
+    stream: UnauthedP2PStream<ECIESStream<MeteredStream<TcpStream>>>,
     session_id: SessionId,
     remote_addr: SocketAddr,
     direction: Direction,
@@ -775,5 +803,6 @@ async fn authenticate_stream(
         status: their_status,
         conn: eth_stream,
         direction,
+        client_id: their_hello.client_version,
     }
 }

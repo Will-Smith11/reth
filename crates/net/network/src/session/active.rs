@@ -12,11 +12,12 @@ use futures::{stream::Fuse, SinkExt, StreamExt};
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::{
     capability::Capabilities,
-    error::{EthStreamError, HandshakeError, P2PStreamError},
+    errors::{EthHandshakeError, EthStreamError, P2PStreamError},
     message::{EthBroadcastMessage, RequestPair},
     DisconnectReason, EthMessage, EthStream, P2PStream,
 };
 use reth_interfaces::p2p::error::RequestError;
+use reth_net_common::bandwidth_meter::MeteredStream;
 use reth_primitives::PeerId;
 use std::{
     collections::VecDeque,
@@ -33,7 +34,7 @@ use tokio::{
     time::Interval,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// The type that advances an established session by listening for incoming messages (from local
 /// node or read from connection) and emitting events back to the [`SessionsManager`].
@@ -47,7 +48,7 @@ pub(crate) struct ActiveSession {
     /// Keeps track of request ids.
     pub(crate) next_id: u64,
     /// The underlying connection.
-    pub(crate) conn: EthStream<P2PStream<ECIESStream<TcpStream>>>,
+    pub(crate) conn: EthStream<P2PStream<ECIESStream<MeteredStream<TcpStream>>>>,
     /// Identifier of the node we're connected to.
     pub(crate) remote_peer_id: PeerId,
     /// The address we're connected to.
@@ -136,7 +137,7 @@ impl ActiveSession {
         match msg {
             msg @ EthMessage::Status(_) => {
                 return Some((
-                    EthStreamError::HandshakeError(HandshakeError::StatusNotInHandshake),
+                    EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake),
                     msg,
                 ))
             }
@@ -247,10 +248,10 @@ impl ActiveSession {
     fn emit_message(&self, message: PeerMessage) {
         let _ = self.try_emit_message(message).map_err(|err| {
             warn!(
-                    target : "net",
-            %err,
-                    "dropping incoming message",
-                );
+                target : "net",
+                %err,
+                "dropping incoming message",
+            );
         });
     }
 
@@ -272,6 +273,7 @@ impl ActiveSession {
 
     /// Report back that this session has been closed.
     fn emit_disconnect(&self) {
+        trace!(target: "net::session", remote_peer_id=?self.remote_peer_id, "emitting disconnect");
         // NOTE: we clone here so there's enough capacity to deliver this message
         let _ = self.to_session.clone().try_send(ActiveSessionMessage::Disconnected {
             peer_id: self.remote_peer_id,
@@ -316,8 +318,9 @@ impl ActiveSession {
                 timedout.push(*id)
             }
         }
+
         for id in timedout {
-            warn!(target: "net::session", remote_peer_id=?self.remote_peer_id, "timed out outgoing request");
+            warn!(target: "net::session", ?id, remote_peer_id=?self.remote_peer_id, "timed out outgoing request");
             let req = self.inflight_requests.remove(&id).expect("exists; qed");
             req.request.send_err_response(RequestError::Timeout);
         }
@@ -350,18 +353,19 @@ impl Future for ActiveSession {
                         progress = true;
                         match cmd {
                             SessionCommand::Disconnect { reason } => {
+                                info!(target: "net::session", ?reason, remote_peer_id=?this.remote_peer_id, "session received disconnect command");
                                 let reason =
                                     reason.unwrap_or(DisconnectReason::DisconnectRequested);
                                 // try to disconnect
-                                match this.start_disconnect(reason) {
+                                return match this.start_disconnect(reason) {
                                     Ok(()) => {
                                         // we're done
-                                        return this.poll_disconnect(cx)
+                                        this.poll_disconnect(cx)
                                     }
                                     Err(err) => {
                                         error!(target: "net::session", ?err, remote_peer_id=?this.remote_peer_id, "could not send disconnect");
                                         this.close_on_error(err);
-                                        return Poll::Ready(())
+                                        Poll::Ready(())
                                     }
                                 }
                             }
@@ -389,11 +393,8 @@ impl Future for ActiveSession {
                         // not ready yet
                         this.received_requests.push(req);
                     }
-                    Poll::Ready(Ok(resp)) => {
+                    Poll::Ready(resp) => {
                         this.handle_outgoing_response(req.request_id, resp);
-                    }
-                    Poll::Ready(Err(_)) => {
-                        // ignore on error
                     }
                 }
             }
@@ -434,6 +435,7 @@ impl Future for ActiveSession {
                         progress = true;
                         match res {
                             Ok(msg) => {
+                                trace!(target: "net::session", msg_id=?msg.message_id(), remote_peer_id=?this.remote_peer_id, "received eth message");
                                 // decode and handle message
                                 if let Some((err, bad_protocol_msg)) = this.on_incoming(msg) {
                                     error!(target: "net::session", ?err, msg=?bad_protocol_msg,  remote_peer_id=?this.remote_peer_id, "received invalid protocol message");
@@ -512,6 +514,7 @@ mod tests {
         EthVersion, HelloMessage, NewPooledTransactionHashes, ProtocolVersion, Status,
         StatusBuilder, UnauthedEthStream, UnauthedP2PStream,
     };
+    use reth_net_common::bandwidth_meter::BandwidthMeter;
     use reth_primitives::{ForkFilter, Hardfork};
     use secp256k1::{SecretKey, SECP256K1};
     use std::time::Duration;
@@ -539,6 +542,7 @@ mod tests {
         status: Status,
         fork_filter: ForkFilter,
         next_id: usize,
+        bandwidth_meter: BandwidthMeter,
     }
 
     impl SessionBuilder {
@@ -583,11 +587,13 @@ mod tests {
             let session_id = self.next_id();
             let (_disconnect_tx, disconnect_rx) = oneshot::channel();
             let (pending_sessions_tx, pending_sessions_rx) = mpsc::channel(1);
+            let metered_stream =
+                MeteredStream::new_with_meter(stream, self.bandwidth_meter.clone());
 
             tokio::task::spawn(start_pending_incoming_session(
                 disconnect_rx,
                 session_id,
-                stream,
+                metered_stream,
                 pending_sessions_tx,
                 remote_addr,
                 self.secret_key,
@@ -654,6 +660,7 @@ mod tests {
                 local_peer_id,
                 status: StatusBuilder::default().build(),
                 fork_filter: Hardfork::Frontier.fork_filter(),
+                bandwidth_meter: BandwidthMeter::default(),
             }
         }
     }
